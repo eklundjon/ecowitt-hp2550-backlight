@@ -1,0 +1,32 @@
+# Firmware images are NEVER committed. You supply your own (see README) and the
+# build runs locally. This is a hard guard against distributing vendor firmware
+# or a derivative of it.
+*.bin
+user.bin
+user_patched.bin
+
+# Build intermediates (assembled payload)
+*.o
+*.elf
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+.claude/
+
+# Local notes and research
+TODO.md
+handoff.md
+research/
