@@ -154,8 +154,21 @@ own region, and validated in emulation before it was ever flashed.
 
 ## Side effects
 
-- Two custom-server fields (Station ID, second upload path) are the mailbox;
-  using the real custom-server upload at the same time collides.
+- **It breaks a concurrent custom-server data upload** (confirmed on hardware,
+  2026-11). The fields don't actually overlap - the Ecowitt-protocol upload rides
+  the *first* upload path, while the mailbox uses the Station ID and the *second*
+  path - so this isn't a shared-field clash. It's the push: every time the poll
+  writes a status it re-sends the whole paths record to the WiFi chip (`0xD2`)
+  from console RAM, and the console's RAM copy of the first path is empty unless
+  it was just refreshed, so the push wipes whatever upload path the chip was
+  using. The chip keeps uploading, now to an empty path, which a real receiver
+  (the HA `ecowitt` integration, ecowitt2mqtt) rejects. The mailbox itself keeps
+  working. Net: the patch is incompatible with pushing the console's own weather
+  data to Home Assistant through its custom server. It's fine when that data
+  reaches HA another way - a separate GW-series gateway, say - or not at all.
+  - Fix (not yet done): have the poll refresh the paths (`0xD1`) before it writes
+    the status and pushes (`0xD2`), the way the screen-open handler does, so the
+    push preserves the upload path. That one change should let the two coexist.
 - The image grows by the appended payload plus the checksum change; the updater
   records the new size and bumps the stored version.
 - A throttled check runs every display frame, plus periodic serial traffic to the

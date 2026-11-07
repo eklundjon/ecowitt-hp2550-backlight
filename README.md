@@ -41,10 +41,16 @@ payload actually work.
 
 ## Side effects
 
-- It repurposes two custom-server fields (the Station ID and the second upload
-  path) as the mailbox. If you also use the console's real custom-server upload,
-  that collides - pick one. Park the upload host somewhere harmless (e.g.
-  `127.0.0.1`) if you're not using it.
+- **It breaks the console's custom-server data upload if you run both** (confirmed
+  on hardware). The fields don't overlap - the Ecowitt upload rides the first
+  upload path, the mailbox uses the Station ID and the second path - but writing a
+  backlight status re-pushes the whole paths record to the WiFi chip from console
+  RAM, which wipes the upload's path. So this patch is incompatible with pushing
+  the console's own weather data to Home Assistant through its custom server (the
+  standard `ecowitt` integration or ecowitt2mqtt). It's fine when the data reaches
+  HA another way (a separate GW-series gateway, say) or not at all. Mechanism and
+  a planned fix: [docs/DESIGN.md](docs/DESIGN.md). Park the upload host harmlessly
+  (e.g. `127.0.0.1`) when it's unused.
 - The image grows by a few hundred bytes and its checksum changes. The SD updater
   records the new size and bumps the stored version on flash.
 - The patched code runs a throttled check every display frame, and drives the
