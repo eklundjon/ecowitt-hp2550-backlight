@@ -1,205 +1,440 @@
 # How the backlight patch works
 
-The design of the HP2550 backlight patch: the hook, the mailbox, the payload,
-and how it survives a firmware update. Useful for anyone porting it to another
-firmware version, auditing it before flashing, or just wondering how you bolt a
-feature onto a console with no source.
+The design of the v2 HP2550 backlight patch: the hook, the mailbox, the payload, and
+how it behaves around the stock firmware. Useful for anyone porting it to another
+firmware version, auditing it before flashing, or wondering how you bolt a feature
+onto a console with no source. The wire protocol is in [PROTOCOL.md](PROTOCOL.md);
+this page is the implementation.
 
-The stock firmware already has backlight on/off and brightness internally -
-there are routines for it, driven by the on-screen menus - but nothing exposes
-them to the network. The WiFi module (an ESP talking to the console MCU over
-serial) serves a TCP API on port 45000, but the console answers only a fixed set
-of commands and none of them touch the backlight. So the capability exists; it
-just has no path from the network to those routines. That path is all the patch
-is.
+The stock firmware already has backlight power and brightness internally - routines
+for them, driven by the on-screen menus and the keypad - but nothing exposes them to
+the network. The WiFi module (an ESP talking to the console MCU over serial) serves a
+TCP API on port 45000, but the console answers only a fixed set of commands and none
+of them touch the backlight. The capability exists; it just has no path from the
+network. That path is all the patch is.
+
+## Evidence basis
+
+Two kinds of claim here, and they're not equally solid.
+
+- **Hardware-tested:** the build in this repo was flashed to an Ambient WS-5000
+  (HP2550, V2.0.4) and driven through every command, the reject cases, a reboot with
+  a pending command, and a visit to the Customized server screen. It also ran against
+  a live Ecowitt upload to a local receiver. Each stock-firmware behaviour listed
+  below as observed was seen on that console.
+- **Static analysis:** addresses, routine behaviour and the "nothing else writes
+  this byte" claims come from reading the disassembly, plus emulating the payload
+  against the real patched bytes with firmware calls stubbed. The emulator is a
+  sanity check, not a predictor. An earlier model of the chip missed a failure that
+  hardware then showed, so a pass there doesn't clear a build for flashing.
+
+Where a section depends on static analysis alone, it says so.
 
 ## The mailbox
 
-Rather than add new network code - new serial commands, new TCP handlers on the
-ESP, both of which we'd have to reverse and patch - the patch borrows two text
-fields the custom-server upload feature already carries end to end: the Station
-ID and the second upload path. A client writes a command into the Station ID
-over the existing port-45000 API; the console writes a status report into the
-second path, which the client reads back. Neither field means anything to the
-backlight normally, and the upload itself can be parked (point its host at
-`127.0.0.1`), so repurposing them costs nothing as long as you're not actually
-uploading.
+Rather than add new network code (new serial commands, new TCP handlers on the ESP,
+all of which we'd have to reverse and patch), the patch borrows two text fields the
+custom-server feature already carries end to end: the Station ID and the password.
+A client writes a command into the Station ID with the existing `0x2B` record write.
+The console writes a status report into the password, which the client reads back with
+`0x2A`. Neither field means anything to the backlight normally.
 
-The wire format is deliberately tiny:
-
-- Command (client → Station ID): `BL <v> #<seq>`, where `v` is `0` (off), `1`
-  (on at the saved level), or `2`-`100` (on at that level).
-- Status (console → second path): `BL <on> <level> #<seq>`, echoing the sequence
-  number it last acted on.
-
-The sequence number is the whole concurrency story. The console acts on a command
-only when its `seq` differs from the one already in the status field, so a client
-bumps `seq` for each new command and the console runs each exactly once. It's
-8-bit (`seq` wraps 1..255), which is plenty when commands are seconds apart.
+The wire format is in [PROTOCOL.md](PROTOCOL.md). The part that matters here is the
+sequence number: the console acts on a command only when its `<seq>` differs from the
+one in the current status, so a client bumps `seq` for each command and the console
+runs each exactly once.
 
 ## The hook
 
-The payload has to run periodically, but there's no spare timer to hijack and no
-RTOS hook to register from a patch. So instead of adding a caller, the patch
-steals one that already runs constantly: the display task (`TaskDisplaySever`)
-redraws the screen in a tight loop, and once per iteration it calls the routine
-that nudges the backlight PWM toward its target. That per-frame call is the hook
-site.
+The payload has to run periodically, but there's no spare timer to hijack and no RTOS
+hook to register from a patch. So instead of adding a caller, the patch steals one
+that already runs constantly. The display task (`TaskDisplaySever`) loops: a 30-tick
+`vTaskDelay`, then a call to the routine that nudges the backlight PWM toward its
+target, then the current screen's draw routine. That apply call is the hook site.
 
-The patch overwrites that one call - 4 bytes, a single Thumb `BL` - so it points
-at the appended payload instead. The payload's entry makes the original call
-first, then runs the poll routine, then returns, so the display loop is none the
-wiser and the backlight fade it expected still happens. A trampoline: original
-behavior, then ours, then back.
+The patch overwrites that one call, a 4-byte Thumb `BL`, so it points at the appended
+payload. The payload's entry makes the original call first, then runs the poll, then
+returns. The display loop is none the wiser, and the fade it expected still happens.
 
 Why this site:
 
-- It's on a non-boot task that only runs once the UI is up, so nothing early in
-  boot can reach it.
-- The loop is self-pacing (gated on the LCD redraw over SPI), so the hook can't
-  spin arbitrarily fast.
-- The call is AAPCS-clean there: the registers the loop needs afterward are set
-  before the call and preserved across it, so a trampoline that saves and
-  restores what it touches is transparent.
+- It's on a non-boot task that only runs once the UI is up, so nothing early in boot
+  can reach it.
+- The call is AAPCS-clean there: the registers the loop needs afterward are set before
+  the call and preserved across it, so a trampoline that saves and restores what it
+  touches is transparent.
+- A write made here is drawn in the same loop iteration, which matters for `DM`
+  (below).
 
-Don't hook the early boot path, and don't hook anything the SD-update path needs
-- a patch that faults before the update task runs can't be recovered from the SD
-card (see Recovery).
+Don't hook the early boot path, and don't hook anything the SD-update path needs - a
+patch that faults before the update task runs can't be recovered from the SD card (see
+Recovery).
 
-## The poll routine
+## The poll
 
-The poll runs every display frame, far too often to be hitting the WiFi chip, so
-the first thing it does is throttle: decrement a one-byte countdown and bail
-unless it reached zero, then reload it. Net effect is a real poll every few
-seconds. The countdown lives in an unused byte of the custom-server record - the
-payload keeps no private mutable RAM of its own, on the theory that any byte it
-picks for scratch is one less thing that can go wrong on a firmware it only half
-understands.
+The poll runs every display frame, far too often to hit the WiFi chip, so it throttles
+first: a one-byte countdown (an unused byte in the custom-server record, reloaded to
+100) that fires a real poll every few seconds. The payload keeps no private mutable
+RAM of its own, on the theory that any byte it picks for scratch is one less thing
+that can go wrong on a firmware it only half understands.
 
-When the throttle fires, the routine:
+When the throttle fires, in order:
 
-1. Bails if the current screen is the Customized-setup screen, so it doesn't
-   fight someone editing those fields on the console by hand.
-2. Asks the WiFi chip to refresh the custom-server record - the same serial
-   request the factory screens issue when you open them. This is asynchronous:
-   the value read this cycle is from last cycle's reply, a one-cycle latency that
-   doesn't matter at seconds-apart commands.
-3. Reads the Station ID, requires the `BL ` prefix, and parses the value and
-   sequence number.
-4. Reads the sequence number back out of the status field - not a private
-   variable - and compares. Equal means already done; bail.
-5. Acts: `v == 0` → off; `v == 1` → on at the saved level; `v` in `2..100` → on,
-   then set that level (clamped).
-6. Writes `BL <on> <level> #<seq>` into the status field and asks the WiFi chip
-   to push the paths back, so a client reading the second path sees the result.
+1. **Stand down** if the current screen is the Customized server screen, or the shared
+   text editor opened from it (below).
+2. **Boot guard:** if no `0xAA` reply has landed yet, queue a refresh and return.
+3. **Last-handled seq:** parse the `#<seq>` or `!<seq>` from the status string in RAM
+   (the dedup, below).
+4. **Parse the command** in the Station ID. No valid `#<seq>` means it isn't a command
+   at all: nothing acts, nothing is acknowledged.
+5. **Act** if the command's seq differs from the last-handled one, or reject it with
+   `!<seq>` if the verb or value is bad.
+6. **Build the status** from live state and the seq. If it differs from the RAM
+   password, copy it in and queue `0xAB` (push the record) - the change gate.
+7. **Queue `0xAA`** (request the record), which refreshes RAM from the chip. This is
+   the last step, always.
 
-Recovering the last-acted sequence from the status field, instead of a variable,
-is what lets the payload carry zero private state - a handy property when you
-can't be sure which RAM is safe to scribble on.
+### Push before refresh
+
+Step 6 coming before step 7 is the most important ordering in the payload, and it
+was not the first thing we tried. The serial queue is FIFO with one consumer, so `0xAB` is
+serialized from RAM before `0xAA` is even sent. The status is already in RAM at that
+point, and the `0xAA` reply that follows returns the record the chip just received.
+It's ordering by construction rather than a timing race.
+
+The reverse order (refresh, wait for the reply, then push) never worked. The `0xAA`
+reply overwrites the RAM password before the push is serialized, so the push sent the
+old status back to the chip and the new one never landed. With no TCP traffic from
+anywhere, the status didn't trail the command; it simply never arrived.
+
+The `0xAB` push carries the whole record from RAM: Station ID, password, host, port,
+interval, type and active. It doesn't carry the upload paths (those go with `0xD2`,
+which the payload never sends). That is what lets the mailbox coexist with a live
+upload, below.
+
+### Boot guard
+
+At boot, RAM isn't the chip's record. BSS is zeroed and the load-time sanity check
+sets only the interval and port, so the host is empty and type/active are 0. With
+push-before-refresh, the first push would send that blank record and wipe the chip's
+upload configuration. The payload therefore does nothing but request a refresh until
+a `0xAA` reply has landed, which the RX handler records by setting a flag byte (zero
+at boot). A push can only follow a reply, so RAM holds the chip's record by then.
+
+The same check covers the Customized screen's draw, which clears the flag: after a
+visit, an act with the push blocked would record the seq nowhere and re-act every
+cycle until a reply landed. The flag semantics are from static analysis, supported by
+the hardware boot and screen-visit tests.
+
+### Dedup from the status
+
+The last-acted seq is the `#<seq>` at the end of the status the payload already keeps
+in the password field. The command (Station ID) and status (password) are two fields
+of one record. Every `0xAA` reply brings both back from the chip together, every
+`0xAB` push sends both, and the stock Customized screen's entry load and exit push move
+the same pair. So the pair in RAM is always a pair the chip held, and "command seq ==
+status seq" means "this command was acted on," however the pair got there: boot, a
+screen visit, a refresh.
+
+This replaced a private dedup byte (kept in RAM at the start of the second upload
+path) that failed two ways. Entering the Customized screen requests the paths from the
+chip, which overwrote that byte with whatever the chip held there, so a later command
+whose seq equalled it was silently ignored. And exiting the screen pushed the byte to
+the chip. A byte that starts at 0 also meant the last command replayed after every
+reboot. Deriving the dedup from the status removed all three. The payload now never
+reads or writes the paths at all.
+
+Edge cases, all emulated and the first two seen on hardware:
+
+- Power cycle with `BP 0 #n` pending and the chip's status at `#n`: no replay. The
+  panel stays on and the status is republished with the live power state.
+- A valid command with an unparseable status (first contact, or someone typed a
+  password on the screen): the command acts once, the status is rebuilt with its seq,
+  and from then on it parses. Idempotent set-state commands make that cheap.
+- A push that fails to land: the next reply returns the old status with the new command
+  still in the slot, so the command acts once more and the push retries. It costs one
+  extra act of a set-state command per dropped push. A dead ESP returns no replies, so
+  nothing repeats.
+
+### Stand-down screens
+
+The payload skips the poll while someone is editing the record by hand. The screen id
+byte indexes the display task's draw table, and four things agree that the Customized
+server screen is **24**: the draw table entry for 24 is the routine whose literal pool
+holds the field names (Station ID, Station Key, IP/Hostname, Port, Interval, State,
+and so on); the key table has its matching handler; the screen dispatcher routes
+`0x18` to that routine; and its exit path stores 5 into the screen byte, making 5 the
+parent (Setup: Wunderground).
+
+Screen 24 has a sub-screen: the shared text editor, **15**, which edits the RAM record
+fields in place. Seven sites enter screen 15 with different return-to ids, so the id
+alone isn't enough. The payload skips when `screen == 24`, or `screen == 15` and the
+return-to byte is 24. Text entry from other screens is left alone. This holds on
+hardware: State toggled to Enabled stays, text typed in the Station ID editor stays.
+
+The static read says the return-to byte holds 24 for the whole edit; I found no writer
+in the editor code, but that's analysis, not a trace.
+
+### Reporting the saved level, or `A`
+
+The status reports the *saved* level (CParam+0x16), or the single character `A` while
+auto-brightness is on. It does not report the runtime level.
+
+The runtime level is what the PWM fade chases, and the level evaluator rewrites it
+every frame: from the solar reading when auto is on, from the saved level when it's
+off. Reporting it makes the status string change nearly every cycle under auto and
+after every command (the fade), and a changing string means a push every cycle. Each
+push carries the Station ID from the previous refresh and overwrites a newer client
+write, (on hardware only 1 of 6 commands under auto landed first try), and each push restarted the ESP's
+upload timer. The saved level is stable, follows keypad changes (hardware-checked: a
+keypad press to 3 reads `BL 30`), and is what `BL n` writes. With auto on, `A` ends
+the drift entirely.
+
+Cost: while the backlight is off, the level field shows the saved level, not 0.
+`BP` carries power, so clients read the pair.
+
+Auto-brightness follows the outdoor solar reading the weather station reports, not a
+sensor in the console.
+
+### BL and BP are orthogonal
+
+Level and power are independent commands. This is deliberate: an earlier set made
+`BL 0`/`BL 1` mean off/on, which collided with 0 being a valid lit level (UI 0 is
+visibly lit) and made it impossible to set levels 0 and 1.
+
+- `BL n`: sets the saved level, clears auto. If the panel is lit it calls
+  `brightness_set(n)`; if dark, it only stores the value, and `BP 1` later lights at
+  it. Only `brightness_set` is called. An earlier `backlight_set(1)` first re-applied
+  the *old* saved level and dipped.
+- `BL A`: auto on, nothing else.
+- `BP 0`/`BP 1`: `backlight_set(0)`/`backlight_set(1)`, the same calls the keypad
+  power key makes. A no-op when the on flag already matches. The no-op matters: a
+  `BP 1` on a lit panel under auto used to jump the panel to the saved level and let
+  the evaluator pull it back, a visible dip per command.
+
+The on flag is written only by `backlight_set`, so it's a reliable lit indicator. One
+residual risk (not seen): if the flag disagrees with the real panel, `BP 1` can't wake
+it until a `BP 0` has been sent.
+
+### DM and its repaint
+
+Dark/light mode is one settings byte, CParam+0x6D, **inverted**: 0 is dark (the
+factory default), 1 is light. It's flipped by the fourth home-screen key. `DM v`
+writes `v ^ 1` and reports `byte == 0 ? 1 : 0`.
+
+The home draw is incremental: it repaints the whole background only when the
+full-redraw flag (`0x40038A`) is set, and a bare byte write would give a mixed look,
+new glyph tables over the old background. So `DM` also sets that flag, **only when the
+screen id is 0 (home)**. Every screen uses that flag as its init flag, so setting it
+on a menu would restart the menu's draw. On other screens the byte is written alone and the home screen
+re-initialises on return. The write sits immediately before the draw call, the same
+store the keypad makes.
+
+Hardware-tested on the home screen in both directions (clean switch, same brightness).
+The behaviour on other screens, and a repaint while a transient overlay is showing,
+are from code reading only.
+
+Nothing in the backlight code reads this byte, so dark mode doesn't change brightness
+(a white background is physically brighter at the same PWM value). The backlight menu
+never touches it either, so a `DM` sent while the menu is open survives, unlike
+`BL`/`BP`/`BS`.
+
+### Validation
+
+A command is rejected, not guessed at. The strictness is there because the Station ID is
+a free-text field anyone with the record write can use, and the console shouldn't turn
+junk into an action.
+
+- A valid seq is `#` directly followed by decimal digits only, value 1-255, ending at
+  the NUL. Anything else (`#0`, `#256`, `#12x`, `#5 junk`) isn't a command: no action
+  and no acknowledgement. Digit parsing saturates, so a long digit string can't wrap
+  32 bits into a valid number.
+- Valid seq with an unknown verb, a bad value, or trailing junk: no action, and the
+  status ends in `!<seq>`. Out-of-range values are rejected, never clamped.
+- The status is built from hardware state, the validated seq, and the `#`/`!` marker.
+  Nothing from the command text is copied into it.
+
+Hardware-tested: `BL 150`, `XY 1`, `BL 40x` all returned `!`; `BL 40 #0` and
+`BL 40 #256` were silently ignored.
+
+### Change-gated push
+
+The status is pushed only when the built string differs from the RAM password. That
+makes pushes events, not a cadence: one per command, one at boot after the first
+reply, and one on a real state change (a keypad power press, a schedule edge, a menu
+change). With auto on and nothing happening, there are none.
+
+This is also the flash-wear and upload-timer reasoning. See Flash wear below.
 
 ## The payload
 
-The payload is hand-written Thumb-2 (see [`backlight.s`](../backlight.s)),
-assembled with LLVM and appended after the image's existing code and data. It's
-position-independent in the way that matters here: every call into stock firmware
-and every data reference goes through an absolute address loaded from a literal
-pool, so the blob assumes nothing about where it lands and needs no relocation.
-It reuses the stock on/off, set-level, apply, and queue-serial-command routines
-rather than reimplementing any of them, and it never writes to its own code
-region at runtime - which is both correct (the image is effectively read-only
-once running) and the reason the no-private-RAM design exists.
+The payload is hand-written Thumb-2 ([`backlight.s`](../backlight.s)), assembled with
+LLVM and appended after the image's existing code and data. It's position-independent
+in the way that matters: every call into stock firmware and every data reference goes
+through an absolute address loaded from a literal pool, so the blob assumes nothing
+about where it lands and needs no relocation. It reuses the stock set-power, set-level,
+apply and queue-serial-command routines rather than reimplementing any, and it never
+writes to its own code region at runtime. It's about 820 bytes.
 
 ## Image integrity and the build
 
-The image ends in a 32-bit little-endian additive checksum: the sum of every
-byte except the last four, stored in the last four. Change any byte and it breaks
-- and the SD updater checks it before flashing (below), so the build has to fix
-it up.
+The image ends in a 32-bit little-endian additive checksum: the sum of every byte
+except the last four, stored in the last four. Change any byte and it breaks, and the
+SD updater checks it before flashing, so the build fixes it up.
 
-`patch.py` is the whole build. It refuses any input whose SHA-256 isn't the known
-stock V2.0.4 image, applies two edits (the 4-byte hook and the appended payload),
-recomputes the checksum, and verifies the result against the known patched hash.
-The edits come from `backlight_edits.json`; `backlight.s` is the source they're
-built from. Nothing here ships or needs the firmware itself - you supply your
-own, and the hashes are the only firmware-derived constants in the repo.
+`patch.py` is the whole build. It refuses any input whose SHA-256 isn't the stock V2.0.4
+image, applies two edits (the 4-byte hook and the appended payload), recomputes the
+checksum, and verifies the result against the known SHA-256 for the build. The edits
+come from `backlight_edits.json`; `backlight.s` is the source they're built from. The
+hashes are the only firmware-derived constants in the repo.
 
 ## Flashing, update and recovery
 
-The console updates from an SD card. On boot the running firmware - not a
-separate bootloader, this is in the application image - looks for `user.bin` on
-the card, checksum-verifies it the same way `patch.py` computes it, and on a
-match flashes it and reboots via watchdog. On a bad checksum it rejects the
-update and leaves the old firmware intact, so a corrupt or mis-sized image fails
-safe rather than bricking.
+The console updates from an SD card. On boot the running firmware (not a separate
+bootloader; this is in the application image) looks for `user.bin` on the card,
+checksum-verifies it the same way `patch.py` does, and on a match flashes it and
+reboots via watchdog. A bad checksum is rejected and the old firmware left intact.
 
-Two behaviors worth knowing:
-
-- After a successful flash the console **deletes** `user.bin` from the card, so
-  it won't re-flash every boot. An update card is single-use; re-stage it to
-  flash again.
-- The firmware uses a dual-tag scheme (two "GPTG" descriptors) to locate the code
-  image, and the updater tolerates one bad tag, failing only if both are bad. A
-  known-good image on the SD card is the recovery path: re-stage stock `user.bin`,
-  insert, power-cycle.
+- After a successful flash the console **deletes** `user.bin` from the card, so it
+  won't re-flash every boot. An update card is single-use.
+- The firmware uses a dual-tag scheme (two "GPTG" descriptors) to locate the code image,
+  and the updater tolerates one bad tag, failing only if both are bad. A known-good
+  image on the SD card is the recovery path: re-stage stock `user.bin`, insert,
+  power-cycle. The stock round-trip was exercised on hardware.
 
 The one unguarded window is pulling the card mid-write. Don't.
 
-Note that the update check runs in its own task (`sdUpgradeTask`), separate from
-the display task the patch hooks, and it polls for the card continuously. So
-recovery survives any failure where the scheduler keeps running - a wrong level,
-a logic bug, even a hung display task. The only thing that defeats it is a hard
-fault that takes the whole MCU down before the update task polls, which is why
-the payload is written to never fault: bounds-checked parsing, no writes to its
-own region, and validated in emulation before it was ever flashed.
+The update check runs in its own task (`sdUpgradeTask`), separate from the display task
+the patch hooks, and polls for the card continuously. So recovery survives any failure
+where the scheduler keeps running: a wrong level, a logic bug, even a hung display task.
+Only a hard fault that takes the whole MCU down before that task polls defeats it,
+which is why the payload is written never to fault (bounds-checked parsing, no writes
+to its own region) and was emulated before it was ever flashed.
+
+## Stock-firmware behaviours worth knowing
+
+These are the console's, not the patch's. Each was seen on hardware unless noted. The
+client-facing consequences are in [PROTOCOL.md](PROTOCOL.md).
+
+- **Leaving the Customized server screen pushes the record as loaded on entry.** A
+  command written during the visit is lost. The screen times out on its own after
+  roughly 1-1.5 minutes and takes the same exit.
+- **The backlight menu writes its entry copy back on exit**, including on timeout. It
+  doesn't refresh live, so a toggle sent while it's open is undone.
+- **The keypad brightness control** shows saved level / 10 (truncated) and steps the raw
+  level by 10 from wherever it is. Starting from a multiple of 10, UI *n* is level 10*n*.
+  UI 0 / level 0 is a lit state.
+- **The keypad starts the settings save** (a countdown, then a flash write of the whole
+  settings block). IP commands don't, deliberately.
+- **Sub-step levels are real.** The backlight drive resolves finer than the keypad's
+  steps of 10, at least at the dim end: levels 0, 5 and 10 are visibly distinct.
+- **An open observation:** during testing, auto-brightness was once unexpectedly on (and
+  stayed on across a reboot) with no IP command that would have set it. We didn't
+  investigate further.
+
+## Flash wear
+
+- **Console:** the only code that writes SPI flash is the SD updater; the page-write
+  primitive is called nowhere else. Settings are read from flash at boot and held in
+  RAM, and a change persists only through the event-triggered save. So the patch writes
+  no console flash. `BL`, `BS` and `DM` write the settings in RAM without starting the
+  save, so they don't survive a reboot (hardware: auto turned on by `BL A` read off again
+  after a reflash and reboot), unless a keypad or menu change saves them first.
+- **WiFi module:** the push lands on the ESP, whose firmware we can't see, so whether it
+  writes the record through to its own flash is unconfirmed. The change gate keeps the
+  push rate to the command rate plus real state changes. That's low, but if you're
+  automating at a high rate it's worth knowing the module's side is unmeasured.
 
 ## Side effects
 
-- **It breaks a concurrent custom-server data upload** (confirmed on hardware,
-  2026-11). The fields don't actually overlap - the Ecowitt-protocol upload rides
-  the *first* upload path, while the mailbox uses the Station ID and the *second*
-  path - so this isn't a shared-field clash. It's the push: every time the poll
-  writes a status it re-sends the whole paths record to the WiFi chip (`0xD2`)
-  from console RAM, and the console's RAM copy of the first path is empty unless
-  it was just refreshed, so the push wipes whatever upload path the chip was
-  using. The chip keeps uploading, now to an empty path, which a real receiver
-  (the HA `ecowitt` integration, ecowitt2mqtt) rejects. The mailbox itself keeps
-  working. Net: the patch is incompatible with pushing the console's own weather
-  data to Home Assistant through its custom server. It's fine when that data
-  reaches HA another way - a separate GW-series gateway, say - or not at all.
-  - Fix (not yet done): have the poll refresh the paths (`0xD1`) before it writes
-    the status and pushes (`0xD2`), the way the screen-open handler does, so the
-    push preserves the upload path. That one change should let the two coexist.
-- The image grows by the appended payload plus the checksum change; the updater
-  records the new size and bumps the stored version.
-- A throttled check runs every display frame, plus periodic serial traffic to the
-  WiFi chip (the record refresh and the path push) - the same commands the
-  factory screens already issue, just more often.
-- The console's auto-brightness and backlight schedule still override remote
-  values when enabled.
+- **Coexists with a live Ecowitt upload** (hardware, 2026-11). The record push restarts
+  the ESP's upload timer, so each command delays the next upload by up to one interval
+  (observed: 32-48 seconds against a 24-second cadence, then straight back). No upload
+  was lost, and the path, host, port, interval and field set never changed. This needs
+  the upload's protocol set to Ecowitt ("Same as AmbWeather"); in Wunderground mode the
+  Station ID and Station Key go upstream as credentials. With the upload disabled the
+  protocol setting doesn't matter (all of the other testing ran that way, in Wunderground
+  mode).
+- The image grows by the appended payload plus the checksum change; the updater records
+  the new size and bumps the stored version.
+- A throttled check runs every display frame, plus the record refresh and the occasional
+  push to the WiFi chip: the same commands the factory screens already issue.
+- Auto-brightness and the schedule still run when enabled.
 
 What it deliberately leaves alone: the factory recovery image and its tag, the
-data-initializer section, the early boot path, and its own code region at
-runtime.
+data-initializer section, the early boot path, the upload paths, and its own code region
+at runtime.
+
+## History
+
+Short, because the lessons are the useful part.
+
+- **v1** (proof of concept): command in the Station ID, status in the second upload
+  path. It worked, and it proved the mailbox idea. It also set brightness by writing
+  the runtime target (which the evaluator overwrites within a frame), stood down on
+  screen 5 instead of 24, and pushed the paths record (`0xD2`) from RAM, wiping the
+  upload path. See [`v1/README.md`](../v1/README.md).
+- **The 0xD1 attempt** (flashed and reverted the same day). The theory was to request
+  the paths (`0xD1`) before pushing, the way the screen-open handler does, so path 1
+  survived. It made the backlight breathe: the chip's async reply overwrote RAM path 2,
+  which held the dedup state, so the console re-ran the leftover `BL 1` every cycle and
+  fought the auto-brightness evaluator. Lesson: don't point a state variable at a field
+  an async reply can overwrite.
+- **Status moves to the password** (first working v2). Pushing the record instead of the
+  paths never touches path 1, which fixed the coexistence problem outright and the
+  breathing with it. But the status never reached the chip, because the reply overwrote
+  RAM before the push was serialized.
+- **Push before refresh, boot guard.** Reordering the queue fixed the status. The reorder
+  made a blank-record push possible at boot, hence the guard. Lesson: ordering by
+  construction beats timing.
+- **Stand-down on 24 and 15.** Hardware showed the payload acting on the Customized
+  screen; the id was wrong in every earlier build.
+- **Saved level, `A` under auto.** Level drift under auto-brightness caused a push per
+  cycle and lost commands.
+- **Dedup from the status; no private byte.** Removed the screen-visit and reboot-replay
+  failures.
+- **`BL 1` no-op when lit,** then the **protocol rework** (`BL`/`BP`/`BS`/`DM`, orthogonal
+  level and power), then **strict validation and the reject ack**. Each was tested on the
+  console before the next.
 
 ## Addresses
 
-All offsets are into `user.bin`, which runs at base 0, so a file offset equals
-its runtime address. These are specific to V2.0.4; a different build moves them,
-which is why the patch is pinned to one firmware.
+All offsets are into `user.bin`, which runs at base 0, so a file offset equals its
+runtime address. They are specific to V2.0.4; a different build moves them, which is why
+the patch is pinned to one firmware. The settings block (CParam) starts at `0x1F19090`.
 
 | What | Address |
 |---|---|
 | Hook site (per-frame apply call in the display loop) | `0x1CA0E` |
 | Appended payload entry | `0x2F06A4` |
-| backlight on/off | `0x43100` |
-| set level | `0x430B0` |
-| apply (PWM fade) | `0x43054` |
+| backlight apply (PWM fade) | `0x43054` |
+| `backlight_set` (power 0/1) | `0x43100` |
+| `brightness_set` (level) | `0x430B0` |
 | queue serial command to the WiFi task | `0x4B138` |
-| command slot (Station ID string) | `0x1F120CF` |
-| status slot (second upload path string) | `0x1F12162` |
+| command slot (Station ID string, record +0x4B) | `0x1F120CF` |
+| status slot (password string, record +0x74) | `0x1F120F8` |
 | poll throttle byte (free byte in the record) | `0x1F12089` |
+| record-valid flag (set by every `0xAA` reply) | `0x1F1D34C` |
 | current screen id | `0x1F1145C` |
+| return-to screen id (text editor) | `0x1F11EB4` |
+| Customized server screen draw / key handler | `0x25EAC` / `0x25C14` |
+| backlight on flag (written only by `backlight_set`) | `0x1F23057` |
+| runtime target level / applied level | `0x1F23056` / `0x1F23058` |
+| saved level (CParam+0x16) | `0x1F190A6` |
+| schedule enable (CParam+0x5B) | `0x1F190EB` |
+| auto-brightness enable (CParam+0x5C) | `0x1F190EC` |
+| auto-brightness max / min level (CParam+0x6B, +0x6C) | `0x1F190FB` / `0x1F190FC` |
+| dark mode byte (CParam+0x6D, 0 = dark) | `0x1F190FD` |
+| settings-save countdown (keypad sets 0x1E) | `0x1F19025` |
+| home full-redraw flag | `0x40038A` |
+| solar lux (full scale 120000) | `0x1F11DA0` |
+| level evaluator | `0x3A224` |
 | display task (`TaskDisplaySever`) | `0x1C984` |
 | SD-update task (`sdUpgradeTask`) | `0x4C7F0` |
 | SD updater (`Interface_UpdateFirmware`) | `0x475D4` |
 | image checksum routine | `0x12E1C` |
+
+The schedule time bytes are the ones the schedule-enforcement code reads; I haven't
+pinned down which of the four is the on-hour, on-minute and so on, and the payload
+doesn't touch them. Everything else in the table is confirmed from the routines that read
+or write it.
