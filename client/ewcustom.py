@@ -6,7 +6,7 @@ Usage:
                                       # custom-server Station ID (command slot); State Disabled unless ACTIVE=1;
                                       # TYPE 0 = Ecowitt, 1 = Wunderground (Station ID only shows for 1)
   ewcustom.py HOST set-host ADDR      # custom-server upload target; other fields kept
-  ewcustom.py HOST set-path TEXT      # first upload path (status slot)
+  ewcustom.py HOST set-path TEXT      # first upload path (the Ecowitt upload path)
   ewcustom.py --dry-run ...           # print frames instead of sending
 """
 import socket
