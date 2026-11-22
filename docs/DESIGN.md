@@ -332,6 +332,63 @@ client-facing consequences are in [PROTOCOL.md](PROTOCOL.md).
   stayed on across a reboot) with no IP command that would have set it. We didn't
   investigate further.
 
+## The WiFi module's TCP server
+
+Port 45000 is served by the WiFi module, not the console, and the patch doesn't touch
+it. Its TCP server has a few habits that a client has to work around. We went looking
+after a client lost a command to a single unanswered exchange. Everything below was
+measured on hardware (module firmware AMBWeatherV4.3.5, console on this patch) with a
+black-box probe and no other client connected.
+
+- **Replies go to the newest connection.** The module serves one client at a time: the
+  connection it accepted most recently, as of when the request arrives. Requests that
+  arrive on older connections are still read and acted on, but their replies go down the
+  newest connection, or are dropped if that one has already closed. Closing the newest
+  connection doesn't hand service back to an older one; the next new connection takes
+  over.
+  - For example, with four connections open, a record read on each of the first three
+    timed out, and the fourth immediately received 162 bytes: three 54-byte replies,
+    none of them its own. With the newest of two (or four) closed, reads on the rest all
+    timed out.
+  - The destination is fixed when the request arrives, not when the reply goes out. A
+    second connection opened about 5 ms after a `0x2B` went out, with the reply due at
+    about 110 ms, didn't take it (6 of 6). Neither did 488 connect-and-close cycles, one
+    every 50 ms, during a command.
+  - This means a client that connects, sends at once and closes after the reply is only
+    exposed for the moment between its connect and its send. A client that holds a
+    connection open and sends on it later loses every reply once anyone else connects,
+    and neither client gets an error that says so.
+  - Note that the request behind a lost reply is still carried out. A timeout on a
+    `0x2B` doesn't tell you whether the record changed, so read it back.
+- **It may not accept while writing.** In 2 of those 6 runs, the second connect wasn't
+  accepted until the write had been answered (113 and 121 ms). Too few runs to call it a
+  rule, but it fits a module that handles one thing at a time.
+- **At most five connections.** With five open, the next connect got no answer at all (a
+  connect timeout, not a refusal). Four held plus one exchange worked. Closing them
+  restored service within a few seconds, with no reboot needed.
+- **It doesn't close after replying.** The module leaves the connection open, so a client
+  that waits for EOF to delimit a reply waits for its own timeout instead; the frame
+  carries its length, so read to that. It does close an idle connection eventually: one
+  left untouched got a FIN after 1219 s (one observation, so roughly a 20 minute idle
+  timeout).
+  - This implies that a client that disappears without closing (a dropped link, a crash
+    mid-exchange) holds one of the five slots for up to about 20 minutes. Five of those
+    at once would lock out new clients for that long.
+- **Latency.** A record read (`0x2A`) was answered in about 20 ms (p95 34 ms, worst
+  217 ms, over 131 reads) and a record write (`0x2B`) in about 120 ms (worst 197 ms,
+  over 100 writes). Connecting took 10-50 ms.
+  - Put another way, a healthy exchange is two orders of magnitude inside a 5 s
+    timeout, so a timeout means a reply that went somewhere else (or nowhere), or a
+    module that stopped answering for a while, not merely a slow reply.
+- **No failures with one client.** Those 131 reads and 100 writes, 10 s apart, were all
+  answered. That's about 17 minutes of traffic, though, so it can't rule out a rare stall.
+
+The cause of the incident that prompted this is still open. A stolen reply needs another
+client to connect inside a window of a millisecond or so, which seems unlikely, and we
+haven't found another client anyway. A stall in the module itself (e.g. while it runs its
+own uploads) is the obvious alternative and hasn't been tested. The client-facing rules
+are in [PROTOCOL.md](PROTOCOL.md).
+
 ## Flash wear
 
 - **Console:** the only code that writes SPI flash is the SD updater; the page-write
@@ -341,7 +398,9 @@ client-facing consequences are in [PROTOCOL.md](PROTOCOL.md).
   save, so they don't survive a reboot (hardware: auto turned on by `BL A` read off again
   after a reflash and reboot), unless a keypad or menu change saves them first.
 - **WiFi module:** the push lands on the ESP, whose firmware we can't see, so whether it
-  writes the record through to its own flash is unconfirmed. The change gate keeps the
+  writes the record through to its own flash is unconfirmed. A `0x2B` write over TCP
+  takes about 100 ms longer to answer than a read, which I suspect is a flash write,
+  but that's circumstantial. The change gate keeps the
   push rate to the command rate plus real state changes. That's low, but if you're
   automating at a high rate it's worth knowing the module's side is unmeasured.
 

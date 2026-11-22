@@ -103,10 +103,27 @@ treating a missing echo as lost.
 note: the poll period is estimated, not measured precisely. The 6-12 second echo
 range is what we saw on hardware.
 
+A single exchange is fast by comparison: about 20 ms for a record read and 120 ms for
+a write (measured). Nearly all of a command's round trip is the console's poll, so a
+per-exchange timeout of a few seconds is generous.
+
 ## Behaviour clients must allow for
 
 These come from the stock firmware, not the patch. The patch can't change them.
 
+- **One client at a time.** The WiFi module sends each reply down the connection it
+  accepted most recently before the request arrived, so a request sent on a connection
+  that something newer has since outranked gets no reply, and you see a timeout. See
+  [The WiFi module's TCP server](DESIGN.md#the-wifi-modules-tcp-server) for the
+  measurements.
+  - Use a fresh connection per exchange, send the request as soon as it connects, and
+    close it as soon as the reply is in. Don't hold connections open: they lose their
+    replies to any newer client, and the module takes at most five.
+  - Treat a timeout as a lost exchange, not a lost command. Reconnect, read the record,
+    and rewrite the command (same seq) only if the command slot doesn't already hold
+    it, since a request whose reply went astray was still carried out.
+  - Read a reply to the length in its frame rather than waiting for EOF: the module
+    never closes the connection first.
 - **Confirm, then send.** Wait for `#<seq>` (applied) or `!<seq>` (rejected: don't
   resend) before the next command. A second command written within one poll cycle
   of the first can be overwritten by the push that reports the first.
